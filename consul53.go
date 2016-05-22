@@ -16,9 +16,6 @@ import (
 
 /*
 TODO:
-	- Logging
-	- Batch updates (wait x ms after update to group)
-	- Swap aws-sdk-go for mitchellh/goamz
 	- Implement leader-election
 	- Better commandline lib
 	- Add marker TXT for X-Consul-Index?
@@ -32,6 +29,9 @@ var (
 	consulAddress string
 	zone          string
 	services      serviceList
+	minWait       time.Duration
+	maxWait       time.Duration
+	dryRun        bool
 	logLevel      log.Level = log.InfoLevel
 )
 
@@ -46,10 +46,13 @@ func (i *serviceList) Set(value string) error {
 
 func init() {
 	var rawLevel string
-	flag.StringVar(&consulAddress, "consul", "localhost:8500", "consul ip:port")
 	flag.StringVar(&zone, "zone", "", "route53 zone id")
-	flag.StringVar(&rawLevel, "log-level", "info", "log level")
 	flag.Var(&services, "service", "service to sync")
+	flag.StringVar(&consulAddress, "consul", "localhost:8500", "consul ip:port")
+	flag.DurationVar(&minWait, "min-wait", 500*time.Millisecond, "minimum quiet time before syncing pending changes")
+	flag.DurationVar(&maxWait, "max-wait", 5*time.Second, "maximum time a change can be pending")
+	flag.StringVar(&rawLevel, "log-level", "info", "log level")
+	flag.BoolVar(&dryRun, "dry-run", false, "if true, do not sync changes to route 53, output to stdout")
 
 	flag.Parse()
 
@@ -69,6 +72,11 @@ func init() {
 		fmt.Println("Must specify at least one service")
 		os.Exit(1)
 	}
+
+	if minWait >= maxWait {
+		fmt.Println("max-wait must be longer than min-wait")
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -82,54 +90,93 @@ func main() {
 
 	// TODO: Wait to aquire lock - OR should that just be on writes? Always watch, but only write if master?
 
-	updates := make(chan serviceResouce)
+	updates := make(chan serviceResourceChange)
 	for _, service := range services {
 		go watchService(catalog, service, updates)
 	}
+
+	pending := make(map[string]serviceResourceChange)
 	for {
 		select {
 		case u := <-updates:
-			log.Debug("Service update: %v\n", u)
-			updateRoute53(dnsClient, u)
+			log.WithFields(log.Fields{"service": u.name, "addresses": u.addresses}).Debug("Service updated")
+			pending[u.name] = u
+
+		case <-time.After(maxWait - maxAge(&pending)):
+			log.WithFields(log.Fields{"pending": pending, "max-wait": maxWait}).Debug("At least one change is older than max-wait threshold. Syncing.")
+			updateRoute53(dnsClient, &pending)
+			clearPendingChanges(&pending)
+
+		case <-time.After(minWait):
+			log.Debug("Sync window expired, checking pending changes")
+			if len(pending) > 0 {
+				log.WithFields(log.Fields{"pending": pending, "min-wait": minWait}).Debug("Pending changes and no updates during min-wait threshold. Syncing.")
+				updateRoute53(dnsClient, &pending)
+				clearPendingChanges(&pending)
+			}
 		}
 	}
 }
 
-type serviceResouce struct {
+func maxAge(changes *map[string]serviceResourceChange) time.Duration {
+	d := 0 * time.Millisecond
+	for _, v := range *changes {
+		if age := time.Since(v.timestamp); age > d {
+			d = age
+		}
+	}
+	return d
+}
+func clearPendingChanges(changes *map[string]serviceResourceChange) {
+	for k := range *changes {
+		delete(*changes, k)
+	}
+}
+
+type serviceResourceChange struct {
 	name      string
 	addresses []string
+	timestamp time.Time
 }
 
-func updateRoute53(serviceClient *route53.Route53, update serviceResouce) {
-	records := make([]*route53.ResourceRecord, len(update.addresses))
-	for idx, ip := range update.addresses {
-		records[idx] = &route53.ResourceRecord{
-			Value: aws.String(ip),
+func updateRoute53(serviceClient *route53.Route53, updates *map[string]serviceResourceChange) {
+	changes := make([]*route53.Change, 0, len(*updates))
+	for _, update := range *updates {
+		records := make([]*route53.ResourceRecord, len(update.addresses))
+		for idx, ip := range update.addresses {
+			records[idx] = &route53.ResourceRecord{
+				Value: aws.String(ip),
+			}
 		}
+		changes = append(changes, &route53.Change{
+			Action: aws.String("UPSERT"),
+			ResourceRecordSet: &route53.ResourceRecordSet{
+				Name:            aws.String(update.name),
+				Type:            aws.String("A"), // TODO: Check for ipv6!
+				ResourceRecords: records,
+				TTL:             aws.Int64(15),
+			},
+		})
 	}
+
 	t := time.Now()
 	change := &route53.ChangeResourceRecordSetsInput{
 		ChangeBatch: &route53.ChangeBatch{
-			Changes: []*route53.Change{
-				{
-					Action: aws.String("UPSERT"),
-					ResourceRecordSet: &route53.ResourceRecordSet{
-						Name:            aws.String(update.name),
-						Type:            aws.String("A"), // TODO: Check for ipv6! Would require splitting into multiple changes
-						ResourceRecords: records,
-						TTL:             aws.Int64(15),
-					},
-				},
-			},
-			Comment: aws.String(fmt.Sprintf("Updated by consul53 at %v", t.Format(time.RFC3339))), // TODO
+			Changes: changes,
+			Comment: aws.String(fmt.Sprintf("Updated by consul53 at %v", t.Format(time.RFC3339))),
 		},
 		HostedZoneId: aws.String(zone),
 	}
-	fmt.Println(change)
-	//resp, err := serviceClient.ChangeResourceRecordSets(params)
+
+	if dryRun {
+		fmt.Println(change)
+	} else {
+		log.Info("Would have updated Amazon, but no code = sad panda")
+		//resp, err := serviceClient.ChangeResourceRecordSets(params)
+	}
 }
 
-func watchService(catalog *consul.Catalog, service string, updates chan serviceResouce) {
+func watchService(catalog *consul.Catalog, service string, updates chan serviceResourceChange) {
 	logger := log.WithFields(log.Fields{"service": service})
 	serviceData, meta, err := catalog.Service(service, "", nil)
 	if err != nil {
@@ -160,7 +207,7 @@ func watchService(catalog *consul.Catalog, service string, updates chan serviceR
 		}
 
 		serviceIPs = latest
-		updates <- serviceResouce{name: service, addresses: serviceIPs}
+		updates <- serviceResourceChange{name: service, addresses: serviceIPs, timestamp: time.Now()}
 	}
 }
 
